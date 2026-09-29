@@ -1,0 +1,279 @@
+#!/bin/bash
+# NAME=make-htb-wordlist
+# VERSION=1.1.0
+# DESCRIPTION=Crée et installe une wordlist de 5000 noms orientée HTB pour la recherche de sous-domaines et de Virtual Hosts à partir de SecLists.
+# PRESENTATION_START
+# **make-htb-wordlist — Wordlist DNS/VHOST pour Hack The Box**
+#
+# `make-htb-wordlist` crée une wordlist de 5000 noms spécialement adaptée à la
+# recherche de sous-domaines et de Virtual Hosts dans les machines Hack The Box.
+#
+# Le script utilise plusieurs wordlists de SecLists. Si SecLists n'est pas déjà
+# installé, il sera installé automatiquement avant la création de la wordlist.
+#
+# La wordlist est installée dans :
+#
+# `/usr/share/wordlists/htb-dns-vh-5000.txt`
+#
+# Cette wordlist est notamment utilisée par mon script `mon-subdomains`.
+#
+# Dans la plupart des cas, il suffit simplement d'exécuter :
+#
+# `make-htb-wordlist`
+#
+# Le script vérifie les prérequis nécessaires et indique les différentes étapes
+# de la création de la wordlist.
+# PRESENTATION_END
+
+set -euo pipefail
+LC_ALL=C
+
+# --- version helpers ---
+# Usage: mettre ce bloc en tête du script. Appel: --version déclenche _print_version_and_exit
+_self_path="${BASH_SOURCE[0]:-$0}"
+# si possible résoudre les symlinks pour afficher le nom réel du fichier
+if command -v readlink >/dev/null 2>&1; then
+  _resolved="$(readlink -f -- "$_self_path" 2>/dev/null || true)"
+  [ -n "$_resolved" ] && _self_path="$_resolved"
+fi
+_self_base="$(basename "$_self_path")"
+
+_version_str() {
+  # récupère la première ligne '# VERSION=...' (tolère espaces autour de '=' et CRLF)
+  # awk lit le fichier et renvoie la partie droite de '=' ; gsub retire CR si présent
+  local v
+  v="$(awk -F= '/^# *VERSION *=/ { gsub(/\r$/,"",$2); print $2; exit }' "$_self_path" 2>/dev/null || true)"
+  [ -n "$v" ] || v="0.0.0"
+  printf '%s %s\n' "$_self_base" "$v"
+}
+
+_print_version_and_exit() { _version_str; exit 0; }
+# -----------------------
+
+
+# --- Configuration ---
+# Produit : /usr/share/wordlists/htb-dns-vh-5000.txt (par défaut)
+# Sources : SecLists DNS top5000 + raft-small + raft-medium + seed FAST prioritaire
+# Règles : minuscules, charset [a-z0-9-], sans '--', ni tiret en début/fin,
+#          longueur 3..24, puis déduplication ordonnée
+
+OUT="/usr/share/wordlists/htb-dns-vh-5000.txt"
+WITH_MEDIUM=1        # garde par défaut raft-medium pour enrichir avant filtrage
+MINLEN=3
+MAXLEN=24
+ALLOW_DIGIT_START=0
+
+# --- Nettoyage des fichiers temporaires ---
+TMP_FAST=""
+TMP_CAT=""
+FILTERED=""
+ORDERED=""
+
+cleanup() {
+  rm -f -- "${TMP_FAST:-}" "${TMP_CAT:-}" "${FILTERED:-}" "${ORDERED:-}"
+}
+trap cleanup EXIT INT TERM
+
+usage() {
+  cat <<EOF
+Usage:
+  make-htb-wordlist [OPTIONS]
+
+Crée une wordlist de 5000 noms adaptée à la recherche de sous-domaines
+et de Virtual Hosts dans les machines Hack The Box.
+
+SecLists est nécessaire à la création de la wordlist. S'il n'est pas déjà
+installé, le script l'installe automatiquement.
+
+Par défaut, la wordlist est créée dans :
+  $OUT
+
+Options:
+  --out FILE           Utiliser un autre fichier de sortie
+  -V, --version        Afficher la version et quitter
+  -h, --help           Afficher cette aide et quitter
+
+Options avancées:
+  --no-medium          Ne pas utiliser la wordlist raft-medium de SecLists
+  --minlen N           Longueur minimale des noms (défaut: $MINLEN)
+  --maxlen N           Longueur maximale des noms (défaut: $MAXLEN)
+  --allow-digit-start  Autoriser les noms commençant par un chiffre
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --out) shift; OUT="${1:-}"; shift || true;;
+    --no-medium) WITH_MEDIUM=0; shift;;
+    --minlen) shift; MINLEN="${1:-3}"; shift || true;;
+    --maxlen) shift; MAXLEN="${1:-24}"; shift || true;;
+    --allow-digit-start) ALLOW_DIGIT_START=1; shift;;
+    -V|--version) _print_version_and_exit ;;
+    -h|--help) usage; exit 0;;
+    *) echo "[!] Option inconnue: $1" >&2; usage; exit 1;;
+  esac
+done
+
+# --- args validation (v1.0.1) ---
+is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
+is_int "$MINLEN" || { echo "[!] --minlen doit être un entier" >&2; exit 1; }
+is_int "$MAXLEN" || { echo "[!] --maxlen doit être un entier" >&2; exit 1; }
+(( MINLEN <= MAXLEN )) || { echo "[!] --minlen doit être <= --maxlen" >&2; exit 1; }
+# --------------------------------
+
+need(){ command -v "$1" >/dev/null 2>&1; }
+
+ensure_seclists(){
+  local dns_list="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+  local raft_small="/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt"
+  local raft_medium="/usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt"
+  local miss=0
+
+  echo "[*] Vérification de SecLists..."
+
+  [[ -f "$dns_list" ]] || miss=1
+  [[ -f "$raft_small" ]] || miss=1
+  if [[ $WITH_MEDIUM -eq 1 && ! -f "$raft_medium" ]]; then miss=1; fi
+
+  if [[ $miss -eq 0 ]]; then
+    echo "[+] SecLists est disponible"
+    echo
+    return 0
+  fi
+
+  echo "[*] SecLists n'est pas installé"
+  need apt || { echo "[!] apt indisponible, installe SecLists manuellement"; exit 1; }
+
+  echo "[*] Installation de SecLists..."
+  sudo apt update && sudo apt install -y seclists
+  echo
+}
+
+echo "[*] Création de la wordlist HTB"
+echo "    Destination : $OUT"
+echo "    Maximum     : 5000 entrées"
+echo
+
+ensure_seclists
+
+DNS_LIST="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+RAFT_SMALL="/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt"
+RAFT_MEDIUM="/usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt"
+
+echo "[*] Construction de la wordlist..."
+
+# Petite seed “FAST” prioritaire en tête
+TMP_FAST="$(mktemp)"
+cat > "$TMP_FAST" <<'EOF'
+admin
+test
+dev
+staging
+stage
+preprod
+prod
+beta
+alpha
+demo
+portal
+internal
+intranet
+secure
+private
+public
+local
+backup
+legacy
+old
+new
+tmp
+api
+app
+apps
+auth
+sso
+vpn
+mail
+ftp
+git
+gitlab
+repo
+db
+mysql
+postgres
+kibana
+grafana
+dashboard
+monitor
+status
+login
+signup
+profile
+console
+cp
+panel
+files
+cdn
+img
+images
+media
+docs
+help
+support
+jira
+wiki
+forum
+upload
+downloads
+owa
+qa
+uat
+EOF
+
+# Concat (priorité = ordre)
+SOURCES=("$TMP_FAST" "$DNS_LIST" "$RAFT_SMALL")
+[[ $WITH_MEDIUM -eq 1 && -f "$RAFT_MEDIUM" ]] && SOURCES+=("$RAFT_MEDIUM")
+
+TMP_CAT="$(mktemp)"; cat "${SOURCES[@]}" | tr '[:upper:]' '[:lower:]' > "$TMP_CAT"
+
+echo "[*] Normalisation et suppression des doublons..."
+
+# Filtrage & normalisation
+FILTERED="$(mktemp)"
+awk -v min="$MINLEN" -v max="$MAXLEN" -v allow="$ALLOW_DIGIT_START" '
+{
+  x=$0
+  sub(/#.*/,"",x)
+  gsub(/^[[:space:]]+|[[:space:]]+$/,"",x)
+  if (x=="") next
+  if (x ~ /[^a-z0-9-]/) next
+  if (x ~ /^-/) next
+  if (x ~ /-$/) next
+  if (x ~ /--/) next
+  if (length(x)<min || length(x)>max) next
+  if (!allow && x !~ /^[a-z]/) next
+  print x
+}' "$TMP_CAT" > "$FILTERED"
+
+# Dédup ordonnée
+ORDERED="$(mktemp)"; awk '!seen[$0]++' "$FILTERED" > "$ORDERED"
+
+echo "[*] Installation de la wordlist..."
+
+# On garde les 5000 premières lignes seulement
+DIR="$(dirname "$OUT")"; [[ -w "$DIR" ]] || sudo mkdir -p "$DIR"
+if [[ -w "$DIR" ]]; then
+  head -n 5000 "$ORDERED" > "$OUT"
+  chmod 644 "$OUT"
+else
+  head -n 5000 "$ORDERED" | sudo tee "$OUT" >/dev/null
+  sudo chmod 644 "$OUT"
+fi
+
+TOTAL="$(wc -l < "$OUT" | tr -d ' ')"
+
+echo
+echo "[+] Wordlist créée avec succès"
+echo "    $TOTAL entrées"
+echo "    $OUT"

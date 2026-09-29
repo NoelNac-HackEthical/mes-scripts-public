@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# NAME=mon-nmap
+# VERSION=2.1.3
+# DESCRIPTION=Automatise l’énumération réseau initiale d’une cible CTF avec plusieurs scans Nmap complémentaires.
+#
+# PRESENTATION_START
+# **mon-nmap — Énumération réseau initiale pour CTF**
+#
+# `mon-nmap` automatise la première phase d’énumération réseau d’une cible CTF.
+#
+# À partir d’une cible unique, le script enchaîne plusieurs scans Nmap
+# complémentaires afin d’identifier les ports ouverts, les services exposés
+# et certaines pistes utiles pour la suite de l’analyse.
+#
+# L’objectif n’est pas simplement de lancer plusieurs commandes Nmap, mais de
+# conserver une méthode d’énumération reproductible d’une machine à l’autre,
+# avec des résultats organisés dans des fichiers séparés.
+#
+# Dans le cas le plus simple :
+#
+# ```bash
+# mon-nmap cible.htb
+# ```
+#
+# Le script effectue successivement :
+#
+# 1. un pré-check TCP de la cible ;
+# 2. un scan complet des ports TCP ;
+# 3. une énumération ciblée FTP / SMB si ces services sont détectés ;
+# 4. un scan agressif sur les ports ouverts ;
+# 5. un scan orienté CMS ;
+# 6. un scan UDP des ports les plus courants.
+#
+# Les résultats sont stockés dans :
+#
+# ```text
+# scans_nmap/<cible>/
+# ```
+#
+# avec notamment :
+#
+# ```text
+# full_tcp_scan.txt
+# enum_ftp_smb_scan.txt
+# aggressive_vuln_scan.txt
+# cms_vuln_scan.txt
+# udp_vuln_scan.txt
+# ```
+#
+# Le pré-check permet de vérifier rapidement que la cible répond sur les ports
+# TCP couramment rencontrés dans les environnements CTF avant de lancer les scans.
+# PRESENTATION_END
+#
+# HOMEPAGE=https://github.com/NoelNac-HackEthical/mes-scripts
+#____________________________________________________________________________
+#
+# Bref résumé :
+#   Automatise une série de scans Nmap (TCP complet, FTP/SMB, agressif, CMS, UDP) pour une cible CTF donnée.
+#
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Helpers version (ne pas modifier)
+_self_path="${BASH_SOURCE[0]:-$0}"
+if command -v readlink >/dev/null 2>&1; then
+  _resolved="$(readlink -f -- "$_self_path" 2>/dev/null || true)"
+  [ -n "$_resolved" ] && _self_path="$_resolved"
+fi
+_self_base="$(basename "$_self_path")"
+
+_version_str(){
+  # lit la première occurrence '# VERSION=' dans le fichier source (robuste CRLF)
+  local v
+  v="$(awk -F= '/^# *VERSION *=/ { gsub(/\r$/,"",$2); print $2; exit }' "$_self_path" 2>/dev/null || true)"
+  v="${v:-0.0.0}"
+  printf '%s v%s\n' "$_self_base" "$v"
+}
+_print_version_and_exit(){ _version_str; exit 0; }
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# USAGE (heredoc)
+usage(){
+  cat <<USAGE
+Usage:
+  ${_self_base} <IP_OU_DOMAINE>
+
+Lance l’énumération réseau initiale d’une cible CTF avec plusieurs
+scans Nmap complémentaires.
+
+Étapes principales :
+  1. Pré-check TCP de la cible
+  2. Scan complet des ports TCP
+  3. Énumération ciblée FTP / SMB si détectés
+  4. Scan agressif sur les ports ouverts
+  5. Scan orienté CMS
+  6. Scan UDP des ports les plus courants
+
+Les résultats sont enregistrés dans :
+  scans_nmap/<cible>/
+
+Options:
+  -h, --help       Affiche cette aide
+  -V, --version    Affiche la version
+  --debug          Active le mode debug
+
+Exemples:
+  ${_self_base} 10.10.10.14
+  ${_self_base} cible.htb
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+
+examples(){
+  cat <<EXAMPLES
+# Scan complet d'une machine CTF (IP directe)
+${_self_base} 10.10.10.14
+
+# Scan d'un domaine d'exercice
+${_self_base} target.htb
+
+# Avec debug bash pour voir les commandes exécutées
+${_self_base} --debug 10.10.10.14
+EXAMPLES
+}
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+run_scans() {
+local target="$1"
+local target_dir
+local output_dir
+
+# Construction du nom de dossier cible
+if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  # Cas IPv4 : 10.129.237.241 -> 10_129_237_241
+  target_dir="${target//./_}"
+else
+  # Cas hostname : planning.htb -> planning
+  target_dir="${target%%.*}"
+
+  # Sécurisation éventuelle
+  target_dir="${target_dir//[^a-zA-Z0-9_-]/_}"
+fi
+
+output_dir="scans_nmap/$target_dir"
+
+  # ---------- Pré-check canonique HTB : validation IP sans ICMP ----------
+  if nc -z -w2 "$target" 80 2>/dev/null \
+     || nc -z -w2 "$target" 443 2>/dev/null \
+     || nc -z -w2 "$target" 22 2>/dev/null; then
+    echo "[*] Pré-check IP OK : $target répond via TCP."
+  else
+    echo "[!] Aucune réponse TCP immédiate depuis $target."
+    echo "[!] L'IP de $target est peut être incorrecte (reset HTB ?)."
+    echo "[!] Vérifie l'IP dans l'interface HTB"
+    echo "[!] et /etc/hosts si tu utilises un nom de domaine."
+    echo
+    read -r -p "Continuer quand même le scan ? [o/N] " rep
+    case "$rep" in
+      [oOyY]) echo "[*] Poursuite du scan malgré l'incertitude sur l'IP." ;;
+      *) echo "[!] Scan interrompu."; return 1 ;;
+    esac
+  fi
+
+  # Création du répertoire de sortie
+  mkdir -p "$output_dir"
+
+  # ===== ÉTAPE 1: SCAN COMPLET DES PORTS TCP =====
+  echo "[1/5] Scan complet des ports TCP sur $target..."
+  nmap -Pn -p- --min-rate 5000 -T4 -oN "$output_dir/full_tcp_scan.txt" "$target"
+
+  # ===== ÉTAPE 2: EXTRACTION DES PORTS OUVERTS =====
+  local ports
+  ports=$(grep -E '^[0-9]+/tcp.*open' "$output_dir/full_tcp_scan.txt" \
+    | awk '{print $1}' \
+    | cut -d'/' -f1 \
+    | tr '\n' ',' \
+    | sed 's/,$//')
+
+  if [[ -z "$ports" ]]; then
+    echo "[!] Aucun port TCP 'open' trouvé dans $output_dir/full_tcp_scan.txt"
+  else
+    echo "Ports ouverts: $ports"
+  fi
+
+  # ===== ÉTAPE 2: ENUM FTP / SMB (si présents) =====
+  echo "[2/5] Enumération FTP / SMB (si services détectés)..."
+
+  # Fichier de sortie (toujours créé)
+  local enum_out="$output_dir/enum_ftp_smb_scan.txt"
+  mkdir -p "$output_dir"
+
+  {
+    echo "# mon-nmap — ENUM FTP / SMB"
+    echo "# Target : $target"
+    echo "# Date   : $(date -Iseconds)"
+    echo
+  } > "$enum_out"
+
+  local enum_scripts=""
+  local enum_ports=""
+
+  # FTP
+  if echo "$ports" | grep -qE '(^|,)21(,|$)'; then
+    enum_ports="${enum_ports}21,"
+    enum_scripts="${enum_scripts}ftp-anon,ftp-syst,"
+  fi
+
+  # SMB
+  if echo "$ports" | grep -qE '(^|,)139(,|$)|(^|,)445(,|$)'; then
+    enum_ports="${enum_ports}139,445,"
+    enum_scripts="${enum_scripts}smb-os-discovery,smb-enum-shares,smb-enum-users,"
+  fi
+
+  # Nettoyage virgules finales
+  enum_ports="${enum_ports%,}"
+  enum_scripts="${enum_scripts%,}"
+
+  if [[ -n "$enum_ports" && -n "$enum_scripts" ]]; then
+    nmap -Pn -sV -p"$enum_ports" \
+      --script="$enum_scripts" \
+      --script-timeout=30s \
+      -T4 \
+      -oN "$enum_out" \
+      "$target"
+  else
+    echo "Aucun service FTP (21) ni SMB (139/445) détecté." >> "$enum_out"
+    echo "Ports ouverts détectés : $ports" >> "$enum_out"
+    echo "Aucun service FTP ou SMB détecté, enum ignorée."
+  fi
+
+  # ===== ÉTAPE 3: SCAN AGRESSIF CIBLÉ (CTF-perfect LEGACY) =====
+  if [ -n "${ports:-}" ]; then
+    echo "[3/5] Scan agressif sur les ports $ports..."
+
+    # Variante LEGACY : scripts utiles en CTF + vieux SSL/TLS
+    local vuln_scripts
+    vuln_scripts="(http-vuln-* or http-shellshock or ssl-heartbleed or ssl-cert) and not (http-vuln-cve2017-1001000 or http-sql-injection or sslv2 or ssl-dh-params)"
+
+    # Commande nmap (pour rappel dans l'en-tête)
+    local scan_cmd
+    scan_cmd="nmap -Pn -A -sV -p\"$ports\" --script=\"$vuln_scripts\" --script-timeout=30s -T4 \"$target\""
+
+    # 1. Lancer le scan complet dans un fichier temporaire
+    local temp_file
+    temp_file="$output_dir/aggressive_vuln_scan_raw.txt"
+
+    nmap -Pn -A -sV -p"$ports" \
+      --script="$vuln_scripts" \
+      --script-timeout=30s \
+      -T4 \
+      -oN "$temp_file" \
+      "$target"
+
+    # 2. Créer un fichier final avec un en-tête + le résultat brut
+    {
+      echo "[+] Scan agressif orienté vulnérabilités (CTF-perfect LEGACY) pour $target"
+      echo "[+] Commande utilisée :"
+      echo "    $scan_cmd"
+      echo
+      cat "$temp_file"
+    } > "$output_dir/aggressive_vuln_scan.txt"
+
+    # 3. Nettoyer le fichier temporaire
+    rm -f "$temp_file"
+  else
+    echo "⚠️  Aucun port TCP ouvert détecté. Scan agressif ignoré."
+  fi
+
+  # ===== ÉTAPE 4: SCAN CIBLÉ CMS =====
+  if [ -n "${ports:-}" ]; then
+    echo "[4/5] Scan orienté CMS sur les ports $ports..."
+    local cms_scripts
+    cms_scripts="http-wordpress-enum,http-wordpress-brute,http-wordpress-users,http-drupal-enum,http-drupal-enum-users,http-joomla-brute,http-generator,http-robots.txt,http-title,http-headers,http-methods,http-enum,http-devframework,http-cakephp-version,http-php-version,http-config-backup,http-backup-finder,http-sitemap-generator"
+
+    nmap -Pn -sV -p"$ports" \
+      --script="$cms_scripts" \
+      --script-timeout=30s \
+      -T4 \
+      -oN "$output_dir/cms_vuln_scan.txt" \
+      "$target"
+  fi
+
+  # ===== ÉTAPE 5: SCAN UDP CIBLÉ =====
+  echo "[5/5] Scan UDP (top 20 ports)..."
+  nmap -n -Pn -sU --top-ports 20 -T4 -oN "$output_dir/udp_vuln_scan.txt" "$target"
+
+  echo "✅ Scans terminés. Résultats disponibles dans $output_dir/"
+  echo "   Scan agressif : $output_dir/aggressive_vuln_scan.txt"
+}
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Parsing minimal CLI
+DEBUG=false
+
+# Aides rapides
+if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+  _print_version_and_exit
+fi
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  _version_str
+  usage
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug) DEBUG=true; shift ;;
+    -V|--version) _print_version_and_exit ;;
+    -h|--help)
+      _version_str
+      usage
+      exit 0
+      ;;
+    --) shift; break ;;
+    -*) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    *) break ;;
+  esac
+done
+# ---------------------------------------------------------------------------
+
+_main(){
+  if [ "$DEBUG" = true ]; then set -x; fi
+
+  if [[ $# -lt 1 ]]; then
+    echo "❌ Usage: ${_self_base} <IP_OU_DOMAINE>" >&2
+    echo
+    usage
+    exit 1
+  fi
+
+  local target="$1"
+  run_scans "$target"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _main "$@"
+fi
