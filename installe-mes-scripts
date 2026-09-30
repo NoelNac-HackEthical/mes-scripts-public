@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# NAME=installe-mes-scripts
+# VERSION=1.0.0
+# DESCRIPTION=Installation et mise à jour des scripts publiés dans mes-scripts-public
+# PRESENTATION_START
+# Installer et maintenir les scripts
+#
+# Ce script installe et met à jour les scripts publiés dans le dépôt GitHub
+# `mes-scripts-public` : https://github.com/NoelNac-HackEthical/mes-scripts-public
+#
+# Les scripts sont installés dans `~/.local/bin/mes-scripts_public`.
+#
+# - installe les scripts absents ;
+# - met à jour les scripts locaux différents de la version publiée ;
+# - conserve les scripts déjà à jour ;
+# - détecte les fichiers locaux qui ne sont plus publiés
+#   et demande s'ils doivent être conservés ou supprimés ;
+# - ajoute `~/.local/bin/mes-scripts` au `PATH` pour Bash ou Zsh ;
+# - vérifie la présence de la wordlist HTB
+#   `/usr/share/wordlists/htb-dns-vh-5000.txt` ;
+# - lance `make-htb-wordlist` si cette wordlist est absente.
+#
+# Première installation :
+# 1. Télécharger `installe-mes-scripts` dans un répertoire accessible,
+#    par exemple `~/tmp`.
+# 2. Le rendre exécutable avec `chmod +x installe-mes-scripts`.
+# 3. Lancer `./installe-mes-scripts`.
+#
+# Exécutions suivantes :
+# `installe-mes-scripts`
+#
+# Le script peut être relancé à tout moment pour vérifier et synchroniser
+# l'installation locale avec les scripts publiés.
+# PRESENTATION_END
+#
+# HOMEPAGE=https://github.com/NoelNac-HackEthical/mes-scripts
+#____________________________________________________________________________
+#
+# Bref résumé :
+#   Installation et mise à jour des scripts publiés dans mes-scripts-public.
+#   Synchronisation avec la version publique, configuration du PATH et
+#   installation de la wordlist HTB si nécessaire.
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Helpers version (ne pas modifier)
+_self_path="${BASH_SOURCE[0]:-$0}"
+if command -v readlink >/dev/null 2>&1; then
+  _resolved="$(readlink -f -- "$_self_path" 2>/dev/null || true)"
+  [ -n "$_resolved" ] && _self_path="$_resolved"
+fi
+_self_base="$(basename "$_self_path")"
+
+_version_str(){
+  # lit la première occurrence '# VERSION=' dans le fichier source (robuste CRLF)
+  local v
+  v="$(awk -F= '/^# *VERSION *=/ { gsub(/\r$/,"",$2); print $2; exit }' "$_self_path" 2>/dev/null || true)"
+  v="${v:-0.0.0}"
+  printf '%s v%s\n' "$_self_base" "$v"
+}
+_print_version_and_exit(){ _version_str; exit 0; }
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# USAGE (heredoc) — extrait automatiquement par la pipeline
+usage(){
+  cat <<USAGE
+Usage: ${_self_base} [OPTIONS]
+
+Installe et met à jour les scripts publiés dans mes-scripts-public.
+
+Le script :
+  - synchronise les scripts dans ~/.local/bin/mes-scripts ;
+  - ajoute ce répertoire au PATH si nécessaire ;
+  - signale les fichiers locaux absents de la publication et demande
+    s'ils doivent être conservés ou supprimés ;
+  - crée la wordlist HTB si elle est absente.
+
+Options:
+  -h, --help     Afficher cette aide
+  -V, --version  Afficher la version
+  --debug        Activer le mode debug
+USAGE
+}
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXAMPLES / ASTUCES (optionnel ; extrait si présent)
+examples(){
+  cat <<EXAMPLES
+# Première installation
+chmod +x installe-mes-scripts
+./installe-mes-scripts
+
+# Exécutions suivantes
+installe-mes-scripts
+
+# Afficher l'aide
+installe-mes-scripts --help
+
+# Afficher la version
+installe-mes-scripts --version
+
+# Mode debug
+installe-mes-scripts --debug
+EXAMPLES
+}
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Parsing CLI
+DEBUG=false
+
+# Aides rapides
+if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+  _print_version_and_exit
+fi
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  _version_str
+  usage
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug)
+      DEBUG=true
+      shift
+      ;;
+    -V|--version)
+      _print_version_and_exit
+      ;;
+    -h|--help)
+      _version_str
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Option inconnue : $1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      echo "Argument inattendu : $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+# ---------------------------------------------------------------------------
+# Configuration
+INSTALL_DIR="$HOME/.local/bin/mes-scripts"
+
+REPO_OWNER="NoelNac-HackEthical"
+REPO_NAME="mes-scripts-public"
+REPO_BRANCH="main"
+
+RAW_BASE_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}"
+MANIFEST_URL="${RAW_BASE_URL}/.sync-manifest"
+# ---------------------------------------------------------------------------
+# Affichage
+info() {
+  printf '[INFO] %s\n' "$*"
+}
+
+ok() {
+  printf '[OK]   %s\n' "$*"
+}
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Détection du shell
+detect_shell_rc() {
+  local shell_name
+
+  shell_name="$(basename "${SHELL:-}")"
+
+  case "$shell_name" in
+    zsh)
+      SHELL_RC="$HOME/.zshrc"
+      ;;
+    bash)
+      SHELL_RC="$HOME/.bashrc"
+      ;;
+    *)
+      printf '[ERREUR] Shell non pris en charge : %s\n' "${SHELL:-inconnu}" >&2
+      return 1
+      ;;
+  esac
+}
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Configuration du PATH
+configure_path() {
+  local path_line
+
+  detect_shell_rc
+
+  path_line='export PATH="$HOME/.local/bin/mes-scripts:$PATH"'
+
+  info "Fichier shell détecté : $SHELL_RC"
+
+  if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
+    printf '[OK]      PATH déjà configuré\n'
+  else
+    printf '\n# mes-scripts\n%s\n' "$path_line" >> "$SHELL_RC"
+    printf '[INSTALL] PATH ajouté dans %s\n' "$SHELL_RC"
+  fi
+
+  export PATH="$INSTALL_DIR:$PATH"
+}
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Affichage du manifeste distant
+show_remote_manifest() {
+  info "Récupération du manifeste public..."
+
+  local manifest
+
+  if ! manifest="$(curl -fsSL "$MANIFEST_URL")"; then
+    printf '[ERREUR] Impossible de récupérer : %s\n' "$MANIFEST_URL" >&2
+    return 1
+  fi
+
+  printf '\nScripts de production publiés :\n\n'
+
+  while IFS= read -r script; do
+    [[ -z "$script" ]] && continue
+    printf '  - %s\n' "$script"
+  done <<< "$manifest"
+}
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Synchronisation des scripts
+sync_scripts() {
+  info "Synchronisation des scripts de production..."
+
+  mkdir -p "$INSTALL_DIR"
+
+  local manifest
+  local script
+  local remote_url
+  local target
+  local tmpfile
+
+  if ! manifest="$(curl -fsSL "$MANIFEST_URL")"; then
+    printf '[ERREUR] Impossible de récupérer : %s\n' "$MANIFEST_URL" >&2
+    return 1
+  fi
+
+  while IFS= read -r script; do
+    [[ -z "$script" ]] && continue
+
+    remote_url="${RAW_BASE_URL}/${script}"
+    target="${INSTALL_DIR}/${script}"
+
+    tmpfile="$(mktemp)"
+
+    if ! curl -fsSL "$remote_url" -o "$tmpfile"; then
+      printf '[ERREUR] Impossible de télécharger : %s\n' "$remote_url" >&2
+      rm -f "$tmpfile"
+      return 1
+    fi
+
+    if [[ ! -e "$target" ]]; then
+      mv "$tmpfile" "$target"
+      chmod 755 "$target"
+      printf '[INSTALL] %s\n' "$script"
+
+    elif cmp -s "$tmpfile" "$target"; then
+      rm -f "$tmpfile"
+      printf '[OK]      %s déjà à jour\n' "$script"
+
+    else
+      mv "$tmpfile" "$target"
+      chmod 755 "$target"
+      printf '[UPDATE]  %s\n' "$script"
+    fi
+  done <<< "$manifest"
+}
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Vérification de la wordlist HTB
+run_wordlist_setup() {
+  local wordlist="/usr/share/wordlists/htb-dns-vh-5000.txt"
+
+  if [[ ! -x "$INSTALL_DIR/make-htb-wordlist" ]]; then
+    printf '[ERREUR] make-htb-wordlist introuvable dans %s\n' "$INSTALL_DIR" >&2
+    return 1
+  fi
+
+  if [[ -f "$wordlist" ]]; then
+    printf '[OK]      Wordlist HTB déjà présente\n'
+    return 0
+  fi
+
+  info "Création des wordlists HTB..."
+  "$INSTALL_DIR/make-htb-wordlist"
+}
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Détection des fichiers locaux absents de la publication
+check_obsolete_files() {
+  info "Recherche de fichiers locaux absents du manifeste..."
+
+  local manifest
+  local file
+  local name
+  local choice
+
+  if ! manifest="$(curl -fsSL "$MANIFEST_URL")"; then
+    printf '[ERREUR] Impossible de récupérer : %s\n' "$MANIFEST_URL" >&2
+    return 1
+  fi
+
+  while IFS= read -r -d '' file; do
+    name="${file##*/}"
+
+    if grep -Fxq -- "$name" <<< "$manifest"; then
+      continue
+    fi
+
+    printf '\n[WARN] %s n'\''est pas publié dans mes-scripts-public.\n' "$name"
+
+    while true; do
+      printf '  [g] garder\n'
+      printf '  [s] supprimer\n'
+      printf 'Choix [g] : '
+
+      if ! read -r choice </dev/tty; then
+        choice="g"
+      fi
+
+      case "${choice,,}" in
+        ""|g)
+          printf '[KEEP]    %s conservé\n' "$name"
+          break
+          ;;
+        s)
+          rm -f -- "$file"
+          printf '[DELETE]  %s supprimé\n' "$name"
+          break
+          ;;
+        *)
+          printf 'Choix invalide. Utilise g ou s.\n'
+          ;;
+      esac
+    done
+
+  done < <(find "$INSTALL_DIR" -maxdepth 1 -type f -perm /111 -print0)
+
+  printf '\n'
+}
+# ---------------------------------------------------------------------------
+
+
+
+_main(){
+  if [ "$DEBUG" = true ]; then
+    set -x
+  fi
+
+  printf '\n=== %s ===\n\n' "$(_version_str)"
+
+  info "Script exécuté depuis : $(pwd)"
+  info "Script utilisé        : ${BASH_SOURCE[0]}"
+  info "Répertoire cible      : $INSTALL_DIR"
+
+  if [[ -d "$INSTALL_DIR" ]]; then
+    info "Installation existante détectée."
+    info "Mode prévu : mise à jour."
+  else
+    info "Aucune installation existante détectée."
+    info "Mode prévu : première installation."
+  fi
+
+  printf '\n'
+  show_remote_manifest
+
+  printf '\n'
+  sync_scripts
+
+  printf '\n'
+  check_obsolete_files
+
+  configure_path
+
+  printf '\n'
+  run_wordlist_setup
+
+  printf '\n'
+  ok "Traitement terminé."
+
+  return 0
+}
+
+# Exécuter _main si appelé directement
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _main "$@"
+fi
