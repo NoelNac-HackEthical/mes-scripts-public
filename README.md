@@ -11,6 +11,14 @@ Scripts Bash que j'utilise pour accompagner mes résolutions de machines Hack Th
 
 Chaque lien mène à la présentation détaillée du script, son utilisation et sa version courante.
 
+## Transparence et utilisation de l'IA
+
+Les scripts sont développés pour répondre à des besoins concrets rencontrés personnellement lors de mes résolutions Hack The Box et de mes travaux en environnement CTF.
+
+L'intelligence artificielle intervient comme outil d'assistance au développement et à la documentation, notamment pour rechercher des solutions techniques, analyser des erreurs, améliorer le code et rédiger les explications.
+
+Les propositions issues de cette assistance sont examinées et adaptées à mes besoins. Je teste personnellement les scripts et valide leur bon fonctionnement avant publication.
+
 ## Téléchargements
 
 Les versions publiées des scripts ainsi que leurs empreintes SHA256 sont disponibles dans les Releases de ce dépôt.
