@@ -2,6 +2,15 @@
 # NAME=mon-nmap
 # VERSION=2.1.3
 # DESCRIPTION=Automatise l’énumération réseau initiale d’une cible CTF avec plusieurs scans Nmap complémentaires.
+
+# Développement assisté par IA
+#
+# Ce script a été conçu avec l'aide de ChatGPT à partir de besoins concrets
+# rencontrés au fil de mes résolutions CTF.
+#
+# Les fonctionnalités, les tests et les adaptations reposent sur mon usage réel.
+# Le script a été modifié, ajusté et amélioré progressivement en fonction des
+# besoins rencontrés au cours de mes résolutions.
 #
 # PRESENTATION_START
 # **mon-nmap — Énumération réseau initiale pour CTF**

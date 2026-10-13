@@ -2,6 +2,15 @@
 # NAME=installe-mes-scripts
 # VERSION=1.0.1
 # DESCRIPTION=Installation et mise à jour de scripts destinés principalement aux phases d'énumération en CTF
+
+# Développement assisté par IA
+#
+# Ce script a été conçu avec l'aide de ChatGPT à partir de besoins concrets
+# rencontrés au fil de mes résolutions CTF.
+#
+# Les fonctionnalités, les tests et les adaptations reposent sur mon usage réel.
+# Le script a été modifié, ajusté et amélioré progressivement en fonction des
+# besoins rencontrés au cours de mes résolutions.
 # PRESENTATION_START
 # Installer et maintenir les scripts
 #
