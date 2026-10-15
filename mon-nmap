@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # NAME=mon-nmap
 # VERSION=2.1.3
+# TITLE=mon-nmap — Automatiser les scans Nmap pour la reconnaissance réseau
 # DESCRIPTION=Automatise l’énumération réseau initiale d’une cible CTF avec plusieurs scans Nmap complémentaires.
-
+#
 # Développement assisté par IA
 #
 # Ce script a été conçu avec l'aide de ChatGPT à partir de besoins concrets

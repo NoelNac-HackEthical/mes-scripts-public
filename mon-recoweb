@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # NAME=mon-recoweb
 # VERSION=3.0.0
+# TITLE=mon-recoweb — Automatiser la reconnaissance web avec dirb et ffuf
 # DESCRIPTION=Reconnaissance web automatisée avec dirb et ffuf, avec scans ciblés de répertoires et fichiers.
-
+#
 # Développement assisté par IA
 #
 # Ce script a été conçu avec l'aide de ChatGPT à partir de besoins concrets

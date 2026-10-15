@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # NAME=mon-subdomains
 # VERSION=2.1.0
+# TITLE=mon-subdomains — Automatiser la découverte de sous-domaines et de vhosts
 # DESCRIPTION=Découverte automatisée de vhosts et sous-domaines avec ffuf, avec détection des hôtes valides et réduction des faux positifs.
-
+#
 # Développement assisté par IA
 #
 # Ce script a été conçu avec l'aide de ChatGPT à partir de besoins concrets

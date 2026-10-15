@@ -1,8 +1,9 @@
 #!/bin/bash
 # NAME=make-htb-wordlist
 # VERSION=1.1.0
+# TITLE=make-htb-wordlist — Générer une wordlist pour la découverte de sous-domaines et de vhosts
 # DESCRIPTION=Crée et installe une wordlist de 5000 noms orientée HTB pour la recherche de sous-domaines et de Virtual Hosts à partir de SecLists.
-
+#
 # Développement assisté par IA
 #
 # Ce script a été conçu avec l'aide de ChatGPT à partir de besoins concrets

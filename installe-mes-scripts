@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # NAME=installe-mes-scripts
 # VERSION=1.0.1
+# TITLE=installe-mes-scripts — Installer et mettre à jour les scripts HackEthical
 # DESCRIPTION=Installation et mise à jour de scripts destinés principalement aux phases d'énumération en CTF
-
+#
 # Développement assisté par IA
 #
 # Ce script a été conçu avec l'aide de ChatGPT à partir de besoins concrets
