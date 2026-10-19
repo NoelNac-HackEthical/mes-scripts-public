@@ -2,6 +2,7 @@
 # NAME=make-htb-wordlist
 # VERSION=1.1.0
 # TITLE=make-htb-wordlist — Générer une wordlist pour la découverte de sous-domaines et de vhosts
+# SEOTITLE=make-htb-wordlist — Wordlist HTB pour sous-domaines et vhosts
 # DESCRIPTION=Crée et installe une wordlist de 5000 noms orientée HTB pour la recherche de sous-domaines et de Virtual Hosts à partir de SecLists.
 #
 # Développement assisté par IA

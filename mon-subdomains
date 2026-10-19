@@ -2,6 +2,7 @@
 # NAME=mon-subdomains
 # VERSION=2.1.0
 # TITLE=mon-subdomains — Automatiser la découverte de sous-domaines et de vhosts
+# SEOTITLE=mon-subdomains — Automatiser la recherche de sous-domaines et vhosts
 # DESCRIPTION=Découverte automatisée de vhosts et sous-domaines avec ffuf, avec détection des hôtes valides et réduction des faux positifs.
 #
 # Développement assisté par IA

@@ -2,6 +2,7 @@
 # NAME=mon-recoweb
 # VERSION=3.0.0
 # TITLE=mon-recoweb — Automatiser la reconnaissance web avec dirb et ffuf
+# SEOTITLE=mon-recoweb — Automatiser la reconnaissance web avec dirb et ffuf
 # DESCRIPTION=Reconnaissance web automatisée avec dirb et ffuf, avec scans ciblés de répertoires et fichiers.
 #
 # Développement assisté par IA
