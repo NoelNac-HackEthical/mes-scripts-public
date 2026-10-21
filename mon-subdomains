@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NAME=mon-subdomains
-# VERSION=2.1.0
+# VERSION=2.2.0
 # TITLE=mon-subdomains — Automatiser la découverte de sous-domaines et de vhosts
 # SEOTITLE=mon-subdomains — Automatiser la recherche de sous-domaines et vhosts
 # DESCRIPTION=Découverte automatisée de vhosts et sous-domaines avec ffuf, avec détection des hôtes valides et réduction des faux positifs.
@@ -14,36 +14,77 @@
 # Le script a été modifié, ajusté et amélioré progressivement en fonction des
 # besoins rencontrés au cours de mes résolutions.
 #
+
 # PRESENTATION_START
-# **mon-subdomains — Découverte de vhosts et sous-domaines pour CTF / pentest**
+# Sur une machine Hack The Box, plusieurs sites web peuvent partager la même
+# adresse IP. Certains ne sont accessibles qu'en utilisant un nom de domaine
+# particulier, appelé *hôte virtuel* ou *vhost*.
 #
-# Ce script automatise la recherche de vhosts (Host: FUZZ.domaine) en interrogeant
-# l'IP cible et en extrayant les hôtes valides (ex. api.domaine.htb, admin.domaine.htb).
+# `mon-subdomains` automatise leur recherche en identifiant les services web
+# accessibles, puis en testant une liste de noms possibles.
 #
-# Fonctionnement :
-# - Résout l'IP de la cible (getent, puis fallback dig).
-# - Effectue un pré-check TCP rapide sur les ports 80/443, sans dépendre de l'ICMP.
-# - Scan Nmap interne (-Pn -sV -p-) pour détecter les ports HTTP/HTTPS exposés.
-# - Pour chaque port web :
-#   - Calcule 3 baselines (code/size/words) avec un Host aléatoire.
-#   - Si baseline 3xx stable : baselines après redirection (curl -L) + fuzzing avec ffuf -r.
-#   - Si wildcard probable : fuzzing sauté pour éviter les faux positifs.
-#   - Sinon : ffuf avec filtres -fs/-fw (et -ac si baseline instable), sortie JSON puis parsing jq.
-# - Agrège les vhosts uniques et écrit un bloc remplacé à chaque run dans :
-#   scans_subdomains/scan_vhosts.txt
+# Il tente également d'éliminer les faux positifs, notamment lorsque le serveur
+# retourne la même page pour des noms inexistants.
 #
-# Wordlists :
-# - Par défaut, le script utilise :
-#   /usr/share/wordlists/htb-dns-vh-5000.txt
-# - Cette wordlist est installée par le script make-htb-wordlist, qu'il faut exécuter
-#   au préalable.
-# - Modes : fast (1000), medium (2000), large (5000)
-# - --custom FILE : utilise une wordlist personnalisée.
+# ### Pour un usage simple
 #
-# Options utiles :
-# - --save-hosts / --dry-run-hosts : ajout contrôlé des vhosts trouvés dans /etc/hosts.
-# - --debug : affiche la commande ffuf et conserve les fichiers temporaires /tmp.
+# Place-toi dans le répertoire de travail de ta machine HTB, puis lance :
+#
+# ```bash
+# mon-subdomains cible.htb
+# ```
+#
+# Le script effectue automatiquement les recherches et enregistre les résultats
+# dans `scans_subdomains/scan_vhosts.txt`.
+#
+# Aucune option supplémentaire n'est nécessaire pour utiliser le mode par défaut.
+#
+# ### Les options les plus utilisées
+#
+# | Option | Utilité |
+# |---|---|
+# | `-f`, `--fast` | Recherche rapide avec 1 000 noms |
+# | `-m`, `--medium` | Recherche intermédiaire avec 2 000 noms |
+# | `-l`, `--large` | Recherche complète avec 5 000 noms (défaut) |
+# | `--custom FILE` | Utiliser sa propre liste de noms |
+# | `-t N` | Modifier le nombre de requêtes simultanées (défaut : 50) |
+# | `--debug` | Afficher la commande ffuf et conserver les fichiers temporaires |
+#
+# **Exemples :**
+#
+# Recherche rapide :
+#
+# ```bash
+# mon-subdomains cible.htb --fast
+# ```
+#
+# Recherche avec une liste personnalisée :
+#
+# ```bash
+# mon-subdomains cible.htb --custom ma-wordlist.txt
+# ```
+#
+# ### Comment fonctionne le script ?
+#
+# En arrière-plan, `mon-subdomains` :
+#
+# 1. Identifie l'adresse IP de la cible.
+# 2. Recherche les ports proposant un service HTTP ou HTTPS.
+# 3. Utilise `ffuf` pour tester les noms de sous-domaines possibles.
+# 4. Analyse les réponses pour limiter les faux positifs, y compris en présence
+#    de redirections.
+# 5. Regroupe les découvertes dans un fichier de résultats.
+#
+# Le script utilise par défaut une wordlist de 5 000 entrées, générée et
+# installée au préalable avec `make-htb-wordlist`.
+#
+# Pour découvrir toutes les options disponibles :
+#
+# ```bash
+# mon-subdomains -h
+# ```
 # PRESENTATION_END
+
 
 set -euo pipefail
 LC_ALL=C
@@ -232,7 +273,8 @@ detect_web_endpoints_from_nmap() {
 
       if grep -qi 'http' <<<"$text"; then
         scheme="http"
-        if grep -qiE 'https|ssl/http|tls' <<<"$text"; then
+        if [[ "$svc" == "https" || "$svc" == "ssl/http" ]] \
+           || grep -qiE '(^|[[:space:]])(https|ssl/http|tls)([[:space:]]|$)' <<<"$text"; then
           scheme="https"
         fi
         endpoints+=("${port}:${scheme}")
@@ -453,13 +495,53 @@ else
     fi
 
     FFUF_FILTER=()
-    [[ "$REF_SIZE"  != "0" ]] && FFUF_FILTER+=(-fs "$REF_SIZE")
-    [[ "$REF_WORDS" != "0" ]] && FFUF_FILTER+=(-fw "$REF_WORDS")
-
     FFUF_AC=()
-    if _needs_autocalibration "$BS1" "$BW1" "$BS2" "$BW2" "$BS3" "$BW3"; then
-      FFUF_AC=(-ac)
-      info "Réponse baseline instable → activation automatique de ffuf -ac"
+
+    if [[ "$FOLLOW_REDIRECTS" -eq 1 ]]; then
+      # Calibration après redirection avec les métriques natives de ffuf.
+      # Une taille légèrement variable ne doit pas invalider une réponse
+      # générique dont code, nombre de mots et lignes sont stables.
+      CAL_WL="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_calwl_${PORT}.XXXXXX")"
+      CAL_JSON="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_cal_${PORT}.XXXXXX.json")"
+      for ((i=1; i<=24; i++)); do
+        printf 'mscal%s%s%02d\n' "$RANDOM" "$RANDOM" "$i" >> "$CAL_WL"
+      done
+
+      CAL_ROWS=()
+      if ffuf -s -u "${SCHEME}://${TARGET_IP}:${PORT}/" \
+          "${FFUF_TLS[@]}" -r -H "Host: FUZZ.${DOMAIN}" \
+          -w "$CAL_WL" -t "$THREADS" -mc all \
+          -of json -o "$CAL_JSON" >/dev/null 2>&1; then
+        mapfile -t CAL_ROWS < <(
+          jq -r '.results[]? | select(.status != null and .words != null and .lines != null) | "\(.status) \(.words) \(.lines)"' \
+            "$CAL_JSON" 2>/dev/null
+        )
+      fi
+
+      if ((${#CAL_ROWS[@]} == 24)) &&
+         [[ "$(printf '%s\n' "${CAL_ROWS[@]}" | sort -u | wc -l)" -eq 1 ]]; then
+        read -r CAL_CODE CAL_WORDS CAL_LINES <<< "${CAL_ROWS[0]}"
+        if [[ "$CAL_WORDS" =~ ^[0-9]+$ && "$CAL_WORDS" -gt 0 ]]; then
+          FFUF_FILTER=(-fw "$CAL_WORDS")
+          info "Calibration ffuf : 24 réponses de référence stables (HTTP ${CAL_CODE}, mots=${CAL_WORDS}, lignes=${CAL_LINES}) → filtre -fw ${CAL_WORDS}"
+        else
+          FFUF_AC=(-ac)
+          warn "Calibration ffuf inexploitable → repli sur -ac"
+        fi
+      else
+        FFUF_AC=(-ac)
+        warn "Calibration ffuf non stable ou incomplète (${#CAL_ROWS[@]}/24) → repli sur -ac"
+      fi
+
+    else
+      # Comportement existant sans redirection
+      [[ "$REF_SIZE"  != "0" ]] && FFUF_FILTER+=(-fs "$REF_SIZE")
+      [[ "$REF_WORDS" != "0" ]] && FFUF_FILTER+=(-fw "$REF_WORDS")
+
+      if _needs_autocalibration "$BS1" "$BW1" "$BS2" "$BW2" "$BS3" "$BW3"; then
+        FFUF_AC=(-ac)
+        info "Réponse baseline instable → activation automatique de ffuf -ac"
+      fi
     fi
 
     FFUF_R=()
@@ -624,4 +706,3 @@ else
 fi
 
 exit 0
-
