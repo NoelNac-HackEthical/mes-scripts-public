@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NAME=mon-subdomains
-# VERSION=2.2.0
+# VERSION=3.0.0
 # TITLE=mon-subdomains — Automatiser la découverte de sous-domaines et de vhosts
 # SEOTITLE=mon-subdomains — Automatiser la recherche de sous-domaines et vhosts
 # DESCRIPTION=Découverte automatisée de vhosts et sous-domaines avec ffuf, avec détection des hôtes valides et réduction des faux positifs.
@@ -23,8 +23,9 @@
 # `mon-subdomains` automatise leur recherche en identifiant les services web
 # accessibles, puis en testant une liste de noms possibles.
 #
-# Il tente également d'éliminer les faux positifs, notamment lorsque le serveur
-# retourne la même page pour des noms inexistants.
+# Le script cherche également à limiter les faux positifs en repérant les
+# réponses habituelles du serveur, même en présence de redirections ou
+# de réponses variables.
 #
 # ### Pour un usage simple
 #
@@ -132,9 +133,9 @@ Options :
                     (défaut: /usr/share/wordlists/htb-dns-vh-5000.txt)
   -t N              Threads ffuf (défaut: 50)
   --timeout S       Timeout curl en secondes (défaut: 8)
-  --strict          Restreint les codes HTTP à 200,401,403
+  --strict          Restreint les codes HTTP à 200,301,302,401,403
   --codes LIST      Codes HTTP transmis à ffuf -mc
-                    (ex: "200,401,403"; prioritaire sur --strict)
+                    (défaut : all ; prioritaire sur --strict)
   --save-hosts      Ajoute les vhosts trouvés dans /etc/hosts
                     (backup, sans doublon)
   --dry-run-hosts   Simule l’ajout dans /etc/hosts sans écrire le fichier
@@ -174,14 +175,14 @@ _run_nmap_scan() {
 }
 
 # ---------- Baseline helpers ----------
+
 _fetch_baseline_metrics() {
   # args: scheme ip port domain timeout follow_redirects(0/1)
   local scheme="$1" ip="$2" port="$3" domain="$4" timeout="$5" follow="${6:-0}"
 
-  local bh code size words url
+  local bh code size words url body_file meta
   local -a curl_tls curl_follow
 
-  # token non vide (important avec set -u)
   bh="$(tr -dc 'a-z0-9' </dev/urandom | head -c 10 2>/dev/null || true)"
   [[ -n "$bh" ]] || bh="rnd$RANDOM"
 
@@ -193,20 +194,32 @@ _fetch_baseline_metrics() {
   curl_follow=()
   [[ "$follow" == "1" ]] && curl_follow+=(-L)
 
-  read -r code size < <(
-    curl -s "${curl_tls[@]}" "${curl_follow[@]}" \
-      -H "Host: ${bh}.${domain}" --max-time "$timeout" \
-      -o /dev/null -w "%{http_code} %{size_download}\n" "$url" 2>/dev/null \
-    || echo "000 0"
-  )
+  body_file="$(mktemp /tmp/mon-subdomains_baseline.XXXXXX)"
 
-  words="$(
+  meta="$(
     curl -s "${curl_tls[@]}" "${curl_follow[@]}" \
-      -H "Host: ${bh}.${domain}" --max-time "$timeout" \
-      "$url" 2>/dev/null | wc -w | tr -d ' ' || echo 0
-  )"
+      -H "Host: ${bh}.${domain}" \
+      --max-time "$timeout" \
+      -o "$body_file" \
+      -w "%{http_code} %{size_download}" \
+      "$url" 2>/dev/null
+  )" || meta="000 0"
 
-  code="${code:-000}"; size="${size:-0}"; words="${words:-0}"
+  read -r code size <<< "$meta"
+
+  code="${code:-000}"
+  size="${size:-0}"
+
+  if [[ -f "$body_file" ]]; then
+    words="$(wc -w < "$body_file" | tr -d ' ')"
+  else
+    words=0
+  fi
+
+  rm -f -- "$body_file"
+
+  words="${words:-0}"
+
   printf '%s %s %s %s\n' "$bh" "$code" "$size" "$words"
 }
 
@@ -246,13 +259,69 @@ _needs_autocalibration() {
 }
 
 # JSON ffuf → vhosts (token FUZZ)
+
 extract_ffuf_json_to_vhosts() {
-  # args: json_file domain
-  local jf="$1" dom="$2"
-  jq -r '.results[].input.FUZZ // empty' "$jf" 2>/dev/null \
-    | awk 'NF{print $0}' \
+  # args: json_file domain wordlist
+  local jf="$1" dom="$2" wl="$3"
+
+  [[ -f "$jf" && -f "$wl" ]] || return 1
+
+  jq -r '.results[]?.input.FUZZ // empty' "$jf" 2>/dev/null \
+    | awk 'NR==FNR {
+             allowed[$0] = 1
+             next
+           }
+           ($0 in allowed) {
+             print $0
+           }' "$wl" - \
     | sed "s/$/.${dom}/" \
     | sort -u
+}
+
+
+# JSON ffuf → vhosts, avec exclusion des signatures génériques
+extract_ffuf_json_filtered() {
+  # args: json_file domain wordlist signatures_file
+  # signatures_file : lignes "code size words lines"
+  local jf="$1" dom="$2" wl="$3" sig="$4"
+
+  [[ -f "$jf" && -f "$wl" && -f "$sig" ]] || return 1
+
+  jq -r '
+    .results[]? |
+    select(
+      .input.FUZZ != null and
+      .status != null and
+      .length != null and
+      .words != null and
+      .lines != null
+    ) |
+    [.input.FUZZ, .status, .length, .words, .lines] |
+    @tsv
+  ' "$jf" 2>/dev/null |
+    awk -F '\t' -v dom="$dom" '
+      FILENAME == ARGV[1] {
+        allowed[$0] = 1
+        next
+      }
+
+      FILENAME == ARGV[2] {
+        n = split($0, fields, /[[:space:]]+/)
+        if (n == 4) {
+          signatures[fields[1] FS fields[2] FS fields[3] FS fields[4]] = 1
+        }
+        next
+      }
+
+      ($1 in allowed) {
+        signature = $2 FS $3 FS $4 FS $5
+
+        if (!(signature in signatures)) {
+          print $1 "." dom
+        }
+      }
+    ' "$wl" "$sig" - |
+    sort -u
 }
 
 # Détection des endpoints HTTP/HTTPS à partir d'un fichier Nmap -sV
@@ -303,8 +372,9 @@ shift || true
 
 MODE="large"; WL=""; THREADS=50; TIMEOUT=8
 MASTER="/usr/share/wordlists/htb-dns-vh-5000.txt"
-STRICT=1
+STRICT=0
 MATCH_CODES="all"
+CODES_EXPLICIT=0
 DEBUG=0
 SAVE_HOSTS=0
 DRY_RUN_HOSTS=0
@@ -319,7 +389,7 @@ while (( "$#" )); do
     -t)          THREADS="${2-}"; shift 2;;
     --timeout)   TIMEOUT="${2-}"; shift 2;;
     --strict)    STRICT=1; shift;;
-    --codes)     MATCH_CODES="${2-}"; shift 2;;
+    --codes)     MATCH_CODES="${2-}"; CODES_EXPLICIT=1; shift 2;;
     --save-hosts)    SAVE_HOSTS=1; shift;;
     --dry-run-hosts) DRY_RUN_HOSTS=1; shift;;
     --debug)     DEBUG=1; shift;;
@@ -329,7 +399,7 @@ while (( "$#" )); do
   esac
 done
 
-if [[ $STRICT -eq 1 && "$MATCH_CODES" == "all" ]]; then
+if [[ $STRICT -eq 1 && $CODES_EXPLICIT -eq 0 ]]; then
   MATCH_CODES="200,301,302,401,403"
 fi
 
@@ -480,22 +550,35 @@ else
       REF_CODE="$LBC1"; REF_SIZE="$LBS1"; REF_WORDS="$LBW1"
     fi
 
-    # Wildcard probable (hors 3xx stable)
-    if _is_wildcard_likely "$BC1" "$BS1" "$BW1" "$BC2" "$BS2" "$BW2" "$BC3" "$BS3" "$BW3"; then
-      warn "Wildcard vhost probable sur ${PORT} (${SCHEME}) → fuzzing sauté pour éviter les faux positifs."
-      info "Explication : la réponse semble identique quel que soit l’en-tête Host → vhost-fuzzing non discriminant sur ce port."
 
-      {
-        echo "  VHOST (0)"
-        echo "    - (fuzzing sauté : wildcard probable)"
-        echo "    - (explication : réponse identique quel que soit Host → vhost-fuzzing non discriminant)"
-        echo
-      } >> "$DETAILS_TXT"
-      continue
+    # Wildcard probable (hors 3xx stable)
+    WILDCARD_404=0
+    WILDCARD_200=0
+
+    if _is_wildcard_likely "$BC1" "$BS1" "$BW1" "$BC2" "$BS2" "$BW2" "$BC3" "$BS3" "$BW3"; then
+      if [[ "$BC1" == "404" ]]; then
+        WILDCARD_404=1
+        info "Wildcard HTTP 404 stable sur ${PORT} (${SCHEME}) → fuzzing maintenu avec filtre -fc 404."
+      elif [[ "$BC1" == "200" ]]; then
+        WILDCARD_200=1
+        info "Wildcard HTTP 200 stable sur ${PORT} (${SCHEME}) → calibration FFUF nécessaire."
+      else
+        warn "Wildcard vhost probable sur ${PORT} (${SCHEME}) → fuzzing sauté pour éviter les faux positifs."
+        info "Explication : la réponse semble identique quel que soit l’en-tête Host → vhost-fuzzing non discriminant sur ce port."
+
+        {
+          echo "  VHOST (0)"
+          echo "    - (fuzzing sauté : wildcard probable)"
+          echo "    - (explication : réponse identique quel que soit Host → vhost-fuzzing non discriminant)"
+          echo
+        } >> "$DETAILS_TXT"
+        continue
+      fi
     fi
 
     FFUF_FILTER=()
     FFUF_AC=()
+    USE_SIG_FILTER=0
 
     if [[ "$FOLLOW_REDIRECTS" -eq 1 ]]; then
       # Calibration après redirection avec les métriques natives de ffuf.
@@ -528,22 +611,131 @@ else
           FFUF_AC=(-ac)
           warn "Calibration ffuf inexploitable → repli sur -ac"
         fi
+
       else
         FFUF_AC=(-ac)
         warn "Calibration ffuf non stable ou incomplète (${#CAL_ROWS[@]}/24) → repli sur -ac"
       fi
 
-    else
-      # Comportement existant sans redirection
-      [[ "$REF_SIZE"  != "0" ]] && FFUF_FILTER+=(-fs "$REF_SIZE")
-      [[ "$REF_WORDS" != "0" ]] && FFUF_FILTER+=(-fw "$REF_WORDS")
+    elif [[ "$WILDCARD_200" -eq 1 ]]; then
+      # Calibration native ffuf des wildcards HTTP 200.
+      CAL_WL="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_calwl_${PORT}.XXXXXX")"
+      CAL_JSON="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_cal_${PORT}.XXXXXX.json")"
 
-      if _needs_autocalibration "$BS1" "$BW1" "$BS2" "$BW2" "$BS3" "$BW3"; then
+      for ((i=1; i<=24; i++)); do
+        printf 'mscal%s%s%02d\n' "$RANDOM" "$RANDOM" "$i" >> "$CAL_WL"
+      done
+
+      CAL_ROWS=()
+      if ffuf -s -u "${SCHEME}://${TARGET_IP}:${PORT}/" \
+          "${FFUF_TLS[@]}" -H "Host: FUZZ.${DOMAIN}" \
+          -w "$CAL_WL" -t "$THREADS" -mc all \
+          -of json -o "$CAL_JSON" >/dev/null 2>&1; then
+        mapfile -t CAL_ROWS < <(
+          jq -r '.results[]? |
+            select(.status != null and .length != null and .words != null and .lines != null) |
+            "\(.status) \(.length) \(.words) \(.lines)"' \
+            "$CAL_JSON" 2>/dev/null
+        )
+      fi
+
+      if ((${#CAL_ROWS[@]} == 24)) &&
+         [[ "$(printf '%s\n' "${CAL_ROWS[@]}" | sort -u | wc -l)" -eq 1 ]]; then
+
+        read -r CAL_CODE CAL_SIZE CAL_WORDS CAL_LINES <<< "${CAL_ROWS[0]}"
+
+        if [[ "$CAL_CODE" == "200" &&
+              "$CAL_SIZE" =~ ^[0-9]+$ &&
+              "$CAL_WORDS" =~ ^[0-9]+$ &&
+              "$CAL_SIZE" -gt 0 &&
+              "$CAL_WORDS" -gt 0 ]]; then
+
+          FFUF_FILTER=(-fs "$CAL_SIZE" -fw "$CAL_WORDS" -fmode and)
+          info "Calibration ffuf : 24 réponses HTTP 200 stables (taille=${CAL_SIZE}, mots=${CAL_WORDS}, lignes=${CAL_LINES}) → filtrage combiné AND"
+        else
+          FFUF_AC=(-ac)
+          warn "Calibration HTTP 200 inexploitable → repli sur -ac"
+        fi
+      else
         FFUF_AC=(-ac)
-        info "Réponse baseline instable → activation automatique de ffuf -ac"
+        warn "Calibration HTTP 200 non stable ou incomplète (${#CAL_ROWS[@]}/24) → repli sur -ac"
+      fi
+
+
+    else
+      # Comportement sans redirection
+      if [[ "$WILDCARD_404" -eq 1 ]]; then
+        FFUF_FILTER=(-fc 404)
+      else
+        if _needs_autocalibration "$BS1" "$BW1" "$BS2" "$BW2" "$BS3" "$BW3"; then
+          info "Baselines variables → calibration native ffuf par signatures."
+
+          CAL_WL="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_calwl_${PORT}.XXXXXX")"
+          CAL_JSON="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_cal_${PORT}.XXXXXX.json")"
+          SIG_FILE="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_signatures_${PORT}.XXXXXX")"
+
+          for ((i=1; i<=24; i++)); do
+            printf 'mscal%s%s%02d\n' "$RANDOM" "$RANDOM" "$i" >> "$CAL_WL"
+          done
+
+          CAL_ROWS=()
+
+          if ffuf -s -u "${SCHEME}://${TARGET_IP}:${PORT}/" \
+              "${FFUF_TLS[@]}" \
+              -H "Host: FUZZ.${DOMAIN}" \
+              -w "$CAL_WL" -t "$THREADS" -mc all \
+              -of json -o "$CAL_JSON" >/dev/null 2>&1; then
+
+            mapfile -t CAL_ROWS < <(
+              jq -r '
+                .results[]? |
+                select(
+                  .status != null and
+                  .length != null and
+                  .words != null and
+                  .lines != null
+                ) |
+                "\(.status) \(.length) \(.words) \(.lines)"
+              ' "$CAL_JSON" 2>/dev/null
+            )
+          fi
+
+
+          # Une calibration partiellement complète peut rester exploitable.
+          # Ne retenir que les signatures observées au moins deux fois.
+          : > "$SIG_FILE"
+
+          if ((${#CAL_ROWS[@]} >= 20 && ${#CAL_ROWS[@]} <= 24)); then
+            printf '%s\n' "${CAL_ROWS[@]}" |
+              sort |
+              uniq -c |
+              awk '$1 >= 2 {
+                print $2, $3, $4, $5
+              }' > "$SIG_FILE"
+          fi
+
+          if [[ -s "$SIG_FILE" ]]; then
+            USE_SIG_FILTER=1
+            FFUF_FILTER=()
+            FFUF_AC=()
+
+            info "Calibration exploitable : ${#CAL_ROWS[@]}/24 réponses, $(wc -l < "$SIG_FILE") signatures génériques confirmées."
+            info "Filtrage JSON activé, sans ffuf -ac."
+          else
+            warn "Calibration insuffisante (${#CAL_ROWS[@]}/24) → repli sur le filtrage précédent."
+
+            [[ "$REF_SIZE"  != "0" ]] && FFUF_FILTER+=(-fs "$REF_SIZE")
+            [[ "$REF_WORDS" != "0" ]] && FFUF_FILTER+=(-fw "$REF_WORDS")
+            FFUF_AC=(-ac)
+          fi
+        else
+          # Baseline sans variation importante : comportement existant.
+          [[ "$REF_SIZE"  != "0" ]] && FFUF_FILTER+=(-fs "$REF_SIZE")
+          [[ "$REF_WORDS" != "0" ]] && FFUF_FILTER+=(-fw "$REF_WORDS")
+        fi
       fi
     fi
-
+    
     FFUF_R=()
     [[ "$FOLLOW_REDIRECTS" -eq 1 ]] && FFUF_R=(-r)
 
@@ -567,8 +759,18 @@ else
       "${CMD[@]}" || true
     fi
 
-    # Extraction fiable via JSON (jq)
-    extract_ffuf_json_to_vhosts "$FFUF_JSON" "$DOMAIN" > "$VHOST_TXT_PORT" || true
+
+    # Extraction des vhosts depuis le JSON ffuf.
+    # Pour les baselines variables, exclure les signatures génériques calibrées.
+    if [[ "$USE_SIG_FILTER" -eq 1 ]]; then
+      extract_ffuf_json_filtered \
+        "$FFUF_JSON" "$DOMAIN" "$WL_EFFECTIVE" "$SIG_FILE" \
+        > "$VHOST_TXT_PORT" || true
+    else
+      extract_ffuf_json_to_vhosts \
+        "$FFUF_JSON" "$DOMAIN" "$WL_EFFECTIVE" \
+        > "$VHOST_TXT_PORT" || true
+    fi
     VHOST_COUNT_PORT="$(grep -c '.' "$VHOST_TXT_PORT" 2>/dev/null || true)"
     VHOST_COUNT_PORT="${VHOST_COUNT_PORT:-0}"
 
