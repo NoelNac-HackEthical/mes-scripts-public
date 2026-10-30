@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NAME=mon-subdomains
-# VERSION=3.0.0
+# VERSION=3.0.1
 # TITLE=mon-subdomains — Automatiser la découverte de sous-domaines et de vhosts
 # SEOTITLE=mon-subdomains — Automatiser la recherche de sous-domaines et vhosts
 # DESCRIPTION=Découverte automatisée de vhosts et sous-domaines avec ffuf, avec détection des hôtes valides et réduction des faux positifs.
@@ -879,7 +879,7 @@ TMP_BLOCK="$(mktemp "/tmp/mon-subdomains_${DOMAIN}_block.XXXXXX")"
 
   echo
   echo "$BLOCK_END"
-  echo
+  # echo
 } > "$TMP_BLOCK"
 
 echo
@@ -893,6 +893,17 @@ if [[ -f "$SCAN_FILE" ]]; then
   sed -e "/^=== mon-subdomains ${DOMAIN} START ===\$/,/^=== mon-subdomains ${DOMAIN} END ===\$/d" \
     "$SCAN_FILE" > "${SCAN_FILE}.tmp" || true
   mv "${SCAN_FILE}.tmp" "$SCAN_FILE"
+fi
+
+# Supprimer les lignes vides en début et en fin de fichier
+if [[ -s "$SCAN_FILE" ]]; then
+  sed -i '/./,$!d' "$SCAN_FILE"
+  sed -i ':a;/^\n*$/{$d;N;ba;}' "$SCAN_FILE"
+fi
+
+# Ajouter une ligne vide entre les blocs
+if [[ -s "$SCAN_FILE" ]]; then
+  echo >> "$SCAN_FILE"
 fi
 
 cat "$TMP_BLOCK" >> "$SCAN_FILE"
