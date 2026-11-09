@@ -4,6 +4,7 @@ Scripts Bash que j'utilise pour accompagner mes résolutions de machines Hack Th
 
 ## Scripts disponibles
 
+- **[installe-mes-scripts](https://writeups.hackethical.be/mes-scripts/installe-mes-scripts/)** — Installe et maintient à jour les scripts, et ajoute la wordlist HTB si elle n'est pas déjà présente.
 - **[mon-nmap](https://writeups.hackethical.be/mes-scripts/mon-nmap/)** — automatisation de l'énumération réseau avec Nmap.
 - **[mon-recoweb](https://writeups.hackethical.be/mes-scripts/mon-recoweb/)** — reconnaissance et énumération d'applications web.
 - **[mon-subdomains](https://writeups.hackethical.be/mes-scripts/mon-subdomains/)** — recherche de sous-domaines et Virtual Hosts.
