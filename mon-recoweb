@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NAME=mon-recoweb
-# VERSION=3.0.0
+# VERSION=3.0.1
 # TITLE=mon-recoweb — Automatiser la reconnaissance web avec dirb et ffuf
 # SEOTITLE=mon-recoweb — Automatiser la reconnaissance web avec dirb et ffuf
 # DESCRIPTION=Reconnaissance web automatisée avec dirb et ffuf, avec scans ciblés de répertoires et fichiers.
@@ -35,6 +35,9 @@
 # 1. `dirb` pour une première découverte ;
 # 2. `ffuf` pour les répertoires ;
 # 3. `ffuf` pour les fichiers.
+#
+# Le script détecte également les redirections HTTP initiales et signale
+# les noms d'hôtes révélés, sans élargir automatiquement le périmètre des scans.
 #
 # Les résultats sont regroupés dans :
 #
@@ -533,6 +536,31 @@ _check_target_accessible(){
   return 1
 }
 
+_detect_initial_redirect(){
+  local url="$1"
+  local headers
+
+  headers="$(curl -ksI --max-time 5 "$url" 2>/dev/null)" || return 0
+
+  printf '%s\n' "$headers" | awk '
+    /^HTTP\// {
+      code=$2
+      location=""
+    }
+
+    tolower($1) == "location:" {
+      location=$0
+      sub(/^[^:]*:[[:space:]]*/, "", location)
+      sub(/\r$/, "", location)
+    }
+
+    END {
+      if (code ~ /^(301|302|303|307|308)$/ && location != "")
+        printf "%s\t%s\n", code, location
+    }
+  '
+}
+
 _detect_soft404_size(){
   local base_url="$1"
   local probe="__monrecoweb_probe_${RANDOM}_${RANDOM}__"
@@ -838,6 +866,29 @@ _main(){
   fi
 
   echo "[+] Cible accessible"
+
+  # Détection de la redirection HTTP initiale (sans suivi)
+  local INITIAL_REDIRECT=""
+  local REDIRECT_CODE=""
+  local REDIRECT_LOCATION=""
+  local REDIRECT_HOST=""
+
+  INITIAL_REDIRECT="$(_detect_initial_redirect "${BASE_URL%/}/")"
+
+  if [[ -n "$INITIAL_REDIRECT" ]]; then
+    IFS=$'\t' read -r REDIRECT_CODE REDIRECT_LOCATION <<< "$INITIAL_REDIRECT"
+
+    if _is_full_url "$REDIRECT_LOCATION"; then
+      REDIRECT_HOST="$(_extract_host_from_url "$REDIRECT_LOCATION")"
+    fi
+
+    echo "[+] Redirection HTTP initiale : $REDIRECT_CODE"
+    echo "    Destination : $REDIRECT_LOCATION"
+
+    if [[ -n "$REDIRECT_HOST" ]]; then
+      echo "    Nom d'hôte  : $REDIRECT_HOST"
+    fi
+  fi
 
   local SOFT404_SIZE=""
 
@@ -1149,9 +1200,27 @@ _main(){
   # RESULTS_SUMMARY
 
   {
-    echo "=== Résultat global (agrégé) ==="
+    echo "=== Redirections HTTP initiales ==="
     echo
 
+    if [[ -n "$INITIAL_REDIRECT" ]]; then
+      echo "URL initiale : ${BASE_URL%/}/"
+      echo "Code HTTP   : $REDIRECT_CODE"
+      echo "Destination : $REDIRECT_LOCATION"
+
+      if [[ -n "$REDIRECT_HOST" ]]; then
+        echo
+        echo "Nom d'hôte révélé :"
+        echo "  $REDIRECT_HOST"
+      fi
+    else
+      echo "(aucune redirection HTTP initiale détectée)"
+    fi
+
+    echo
+    echo "=== Résultat global (agrégé) ==="
+    echo
+    
     {
       # ---------------------------------------------------------------------
       # DIRB : courant ou conservé
