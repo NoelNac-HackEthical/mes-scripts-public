@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NAME=mon-subdomains
-# VERSION=3.0.1
+# VERSION=3.1.0
 # TITLE=mon-subdomains — Automatiser la découverte de sous-domaines et de vhosts
 # SEOTITLE=mon-subdomains — Automatiser la recherche de sous-domaines et vhosts
 # DESCRIPTION=Découverte automatisée de vhosts et sous-domaines avec ffuf, avec détection des hôtes valides et réduction des faux positifs.
@@ -79,6 +79,26 @@
 # Le script utilise par défaut une wordlist de 5 000 entrées, générée et
 # installée au préalable avec `make-htb-wordlist`.
 #
+# ### Affichage adaptatif de la progression
+#
+# La progression de `ffuf` s'adapte dynamiquement à la largeur
+# du terminal, sans perdre les informations affichées.
+#
+# Lorsque la largeur du terminal est insuffisante, la progression
+# est répartie sur plusieurs lignes, sans accumulation des
+# actualisations successives.
+#
+# Le redimensionnement du terminal pendant un scan est pris
+# en charge, tout comme la console interactive de `ffuf`.
+#
+# Cette fonctionnalité utilise Python 3 lorsqu'il est disponible.
+# En son absence, `mon-subdomains` conserve l'affichage natif de `ffuf`.
+#
+# Python 3 reste donc une dépendance facultative.
+#
+# En mode `--debug`, l'affichage natif de `ffuf` est conservé
+# afin de préserver la journalisation des scans.
+#
 # Pour découvrir toutes les options disponibles :
 #
 # ```bash
@@ -143,6 +163,245 @@ Options :
   -V, --version     Affiche la version et quitte
   -h, --help        Affiche cette aide
 USAGE
+}
+
+# Affichage adaptatif de FFUF
+# Python 3 facultatif : retour au mode natif si indisponible
+# ---------------------------------------------------------------------------
+_ffuf_adaptive() {
+  # Retour au fonctionnement natif si Python est absent
+  # ou si la sortie ne correspond pas à un terminal.
+  if ! command -v python3 >/dev/null 2>&1 ||
+     [[ ! -t 1 || ! -t 2 ]]; then
+    ffuf "$@"
+    return $?
+  fi
+
+  python3 - "$@" <<'PYTHON'
+import os
+import re
+import sys
+import signal
+import selectors
+import subprocess
+import shutil
+import textwrap
+
+progress_pattern = re.compile(
+    rb":: Progress: \[\d+/\d+\]"
+    rb" :: Job \[\d+/\d+\]"
+    rb" :: \d+ req/sec"
+    rb" :: Duration: \[[^\]]+\]"
+    rb" :: Errors: \d+ ::"
+)
+
+prefix = b":: Progress: ["
+buffer = b""
+progress = ""
+displayed_rows = 0
+displayed_lines = []
+last_width = 0
+resized = False
+paused = False
+
+
+def write(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def terminal_width():
+    return max(1, shutil.get_terminal_size().columns - 1)
+
+
+def erase_progress():
+    global displayed_rows, displayed_lines
+
+    if displayed_rows:
+        rows = displayed_rows
+        width = terminal_width()
+
+        if width < last_width:
+            columns = width + 1
+
+            rows = sum(
+                max(1, (len(line) + columns - 1) // columns)
+                for line in displayed_lines
+            )
+
+        write("\r\x1b[2K")
+
+        for _ in range(rows - 1):
+            write("\x1b[1A\r\x1b[2K")
+
+    displayed_rows = 0
+    displayed_lines = []
+
+
+def show_progress():
+    global displayed_rows, displayed_lines, last_width
+
+    if not progress or paused:
+        return
+
+    width = terminal_width()
+
+    lines = textwrap.wrap(
+        progress,
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False
+    )
+
+    write("\r\n".join(lines))
+
+    displayed_rows = len(lines)
+    displayed_lines = lines
+    last_width = width
+
+
+def update_progress(text):
+    global progress
+
+    erase_progress()
+    progress = text
+    show_progress()
+
+
+def print_message(text):
+    global paused
+
+    erase_progress()
+
+    if "------ PAUSING ------" in text:
+        paused = True
+
+    elif "------ RESUMING -----" in text:
+        paused = False
+
+    write(text)
+
+    if not text.endswith("\n"):
+        write("\n")
+
+    show_progress()
+
+def process_buffer():
+    global buffer
+
+    while buffer:
+        if paused and buffer.startswith(b"> "):
+            write("> ")
+            buffer = buffer[2:]
+            continue
+
+        if buffer.startswith(prefix):
+            match = progress_pattern.match(buffer)
+
+            if match:
+                update_progress(
+                    match.group().decode(
+                        "utf-8", errors="replace"
+                    )
+                )
+                buffer = buffer[match.end():]
+                continue
+
+            if b"\n" not in buffer:
+                break
+
+        newline = buffer.find(b"\n")
+        start = buffer.find(prefix)
+
+        if newline >= 0 and (
+            start < 0 or newline < start
+        ):
+            message = buffer[:newline + 1]
+            buffer = buffer[newline + 1:]
+
+            print_message(
+                message.decode("utf-8", errors="replace")
+            )
+
+        elif start > 0:
+            message = buffer[:start]
+            buffer = buffer[start:]
+
+            print_message(
+                message.decode("utf-8", errors="replace")
+            )
+
+        else:
+            break
+
+
+def on_resize(signum, frame):
+    global resized
+    resized = True
+
+
+def on_interrupt(signum, frame):
+    # FFUF reçoit également SIGINT.
+    # Python continue de traiter sa sortie finale.
+    pass
+
+
+signal.signal(signal.SIGWINCH, on_resize)
+signal.signal(signal.SIGINT, on_interrupt)
+
+process = subprocess.Popen(
+    ["ffuf", *sys.argv[1:]],
+    stdin=None,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT
+)
+
+selector = selectors.DefaultSelector()
+selector.register(process.stdout, selectors.EVENT_READ)
+
+try:
+    while True:
+        if resized:
+            resized = False
+
+            if terminal_width() != last_width:
+                erase_progress()
+                show_progress()
+
+        events = selector.select(timeout=0.1)
+
+        if not events:
+            continue
+
+        data = os.read(process.stdout.fileno(), 4096)
+
+        if not data:
+            break
+
+        buffer += data
+        process_buffer()
+
+    erase_progress()
+
+    if buffer:
+        write(buffer.decode("utf-8", errors="replace"))
+
+    if progress:
+        show_progress()
+        write("\n")
+
+finally:
+    selector.close()
+    process.stdout.close()
+
+returncode = process.wait()
+
+if returncode < 0:
+    returncode = 128 + abs(returncode)
+
+sys.exit(returncode)
+PYTHON
 }
 
 _run_nmap_scan() {
@@ -746,7 +1005,7 @@ else
 
     info "Recherche de sous-domaines virtuels avec ffuf..."
 
-    CMD=(ffuf -u "${SCHEME}://${TARGET_IP}:${PORT}/" "${FFUF_TLS[@]}" "${FFUF_R[@]}"
+    CMD=(_ffuf_adaptive -u "${SCHEME}://${TARGET_IP}:${PORT}/" "${FFUF_TLS[@]}" "${FFUF_R[@]}"
               -H "Host: FUZZ.${DOMAIN}"
               -w "$WL_EFFECTIVE" -t "$THREADS"
               -mc "${MATCH_CODES}" "${FFUF_FILTER[@]}" "${FFUF_AC[@]}"
