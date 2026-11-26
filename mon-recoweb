@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # NAME=mon-recoweb
-# VERSION=3.0.1
+# VERSION=3.1.0
 # TITLE=mon-recoweb — Automatiser la reconnaissance web avec dirb et ffuf
 # SEOTITLE=mon-recoweb — Automatiser la reconnaissance web avec dirb et ffuf
-# DESCRIPTION=Reconnaissance web automatisée avec dirb et ffuf, avec scans ciblés de répertoires et fichiers.
+# DESCRIPTION=Reconnaissance web automatisée avec dirb et ffuf, scans ciblés et filtrage personnalisable des résultats.
 #
 # Développement assisté par IA
 #
@@ -43,6 +43,38 @@
 #
 # ```text
 # RESULTS_SUMMARY.txt
+# ```
+#
+# ## Sélectionner les codes HTTP
+#
+# Par défaut, `mon-recoweb` configure `ffuf` pour retenir tous
+# les codes HTTP, à l'exception du code 404 qui est filtré.
+#
+# Cette approche permet notamment de découvrir des ressources
+# retournant des codes HTTP que le matcher natif de `ffuf`
+# ne retient pas par défaut, comme les redirections 303 et 308.
+#
+# Tu peux restreindre les codes HTTP recherchés avec l'option `--mc` :
+#
+# ```bash
+# mon-recoweb cible.htb --mc 200,301,302,303,307,308
+# ```
+#
+# L'option `--fc` permet quant à elle d'exclure certains codes HTTP :
+#
+# ```bash
+# mon-recoweb cible.htb --fc 404,403
+# ```
+#
+# Les mécanismes de filtrage automatique des soft-404 restent actifs.
+#
+# ## Scanner un port HTTP non standard
+#
+# Lorsque le serveur web écoute sur un port non standard,
+# précise directement ce port dans la cible :
+#
+# ```bash
+# mon-recoweb cible.htb:3000
 # ```
 #
 # ## Scanner un répertoire précis
@@ -90,6 +122,23 @@
 # Si `ffuf-files` et `ffuf-dirs` nécessitent des filtres différents, lance-les
 # séparément ou en parallèle. Les résultats sont fusionnés dans
 # `RESULTS_SUMMARY.txt`.
+#
+# ## Affichage adaptatif de la progression
+#
+# La progression de `ffuf` s'adapte dynamiquement à la largeur
+# du terminal, sans perdre les informations affichées.
+#
+# Lorsque la largeur du terminal est insuffisante, la progression
+# est répartie sur plusieurs lignes, sans accumulation des
+# actualisations successives.
+#
+# Le redimensionnement du terminal pendant un scan est pris
+# en charge, tout comme la console interactive de `ffuf`.
+#
+# Cette fonctionnalité utilise Python 3 lorsqu'il est disponible.
+# En son absence, `mon-recoweb` conserve l'affichage natif de `ffuf`.
+#
+# Python 3 reste donc une dépendance facultative.
 #
 # ## Pour aller plus loin
 #
@@ -172,6 +221,7 @@ Usage avancé:
 
 Cible:
   cible.htb
+  cible.htb:3000
   http://10.10.10.10
   cible.htb/cgi-bin/
 
@@ -195,6 +245,7 @@ Ciblage:
                          Exemple : --ext php,txt,bak
 
 Filtres ffuf:
+  --mc <codes>           Codes HTTP à retenir (défaut : all)
   --fc <codes>           Codes HTTP à filtrer
                          Défaut : 404
 
@@ -270,6 +321,7 @@ BASE="/"
 THREADS=30
 RATE=""
 TIMEOUT=10
+FFUF_MC="all"
 FFUF_FC="404"
 FFUF_FS=""
 FFUF_EXTRA_OPTS=""
@@ -346,6 +398,11 @@ while [[ $# -gt 0 ]]; do
 
     --timeout)
       TIMEOUT="${2:-}"
+      shift 2
+      ;;
+
+    --mc)
+      FFUF_MC="${2:-}"
       shift 2
       ;;
 
@@ -790,6 +847,246 @@ fi
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Affichage adaptatif de FFUF
+# Python 3 facultatif : retour au mode natif si indisponible
+# ---------------------------------------------------------------------------
+_ffuf_adaptive() {
+  # Retour au fonctionnement natif si Python est absent
+  # ou si la sortie ne correspond pas à un terminal.
+  if ! command -v python3 >/dev/null 2>&1 ||
+     [[ ! -t 1 || ! -t 2 ]]; then
+    ffuf "$@"
+    return $?
+  fi
+
+  python3 - "$@" <<'PYTHON'
+import os
+import re
+import sys
+import signal
+import selectors
+import subprocess
+import shutil
+import textwrap
+
+progress_pattern = re.compile(
+    rb":: Progress: \[\d+/\d+\]"
+    rb" :: Job \[\d+/\d+\]"
+    rb" :: \d+ req/sec"
+    rb" :: Duration: \[[^\]]+\]"
+    rb" :: Errors: \d+ ::"
+)
+
+prefix = b":: Progress: ["
+buffer = b""
+progress = ""
+displayed_rows = 0
+displayed_lines = []
+last_width = 0
+resized = False
+paused = False
+
+
+def write(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def terminal_width():
+    return max(1, shutil.get_terminal_size().columns - 1)
+
+
+def erase_progress():
+    global displayed_rows, displayed_lines
+
+    if displayed_rows:
+        rows = displayed_rows
+        width = terminal_width()
+
+        if width < last_width:
+            columns = width + 1
+
+            rows = sum(
+                max(1, (len(line) + columns - 1) // columns)
+                for line in displayed_lines
+            )
+
+        write("\r\x1b[2K")
+
+        for _ in range(rows - 1):
+            write("\x1b[1A\r\x1b[2K")
+
+    displayed_rows = 0
+    displayed_lines = []
+
+
+def show_progress():
+    global displayed_rows, displayed_lines, last_width
+
+    if not progress or paused:
+        return
+
+    width = terminal_width()
+
+    lines = textwrap.wrap(
+        progress,
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False
+    )
+
+    write("\r\n".join(lines))
+
+    displayed_rows = len(lines)
+    displayed_lines = lines
+    last_width = width
+
+
+def update_progress(text):
+    global progress
+
+    erase_progress()
+    progress = text
+    show_progress()
+
+
+def print_message(text):
+    global paused
+
+    erase_progress()
+
+    if "------ PAUSING ------" in text:
+        paused = True
+
+    elif "------ RESUMING -----" in text:
+        paused = False
+
+    write(text)
+
+    if not text.endswith("\n"):
+        write("\n")
+
+    show_progress()
+
+def process_buffer():
+    global buffer
+
+    while buffer:
+        if paused and buffer.startswith(b"> "):
+            write("> ")
+            buffer = buffer[2:]
+            continue
+
+        if buffer.startswith(prefix):
+            match = progress_pattern.match(buffer)
+
+            if match:
+                update_progress(
+                    match.group().decode(
+                        "utf-8", errors="replace"
+                    )
+                )
+                buffer = buffer[match.end():]
+                continue
+
+            if b"\n" not in buffer:
+                break
+
+        newline = buffer.find(b"\n")
+        start = buffer.find(prefix)
+
+        if newline >= 0 and (
+            start < 0 or newline < start
+        ):
+            message = buffer[:newline + 1]
+            buffer = buffer[newline + 1:]
+
+            print_message(
+                message.decode("utf-8", errors="replace")
+            )
+
+        elif start > 0:
+            message = buffer[:start]
+            buffer = buffer[start:]
+
+            print_message(
+                message.decode("utf-8", errors="replace")
+            )
+
+        else:
+            break
+
+
+def on_resize(signum, frame):
+    global resized
+    resized = True
+
+
+def on_interrupt(signum, frame):
+    # FFUF reçoit également SIGINT.
+    # Python continue de traiter sa sortie finale.
+    pass
+
+
+signal.signal(signal.SIGWINCH, on_resize)
+signal.signal(signal.SIGINT, on_interrupt)
+
+process = subprocess.Popen(
+    ["ffuf", *sys.argv[1:]],
+    stdin=None,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT
+)
+
+selector = selectors.DefaultSelector()
+selector.register(process.stdout, selectors.EVENT_READ)
+
+try:
+    while True:
+        if resized:
+            resized = False
+
+            if terminal_width() != last_width:
+                erase_progress()
+                show_progress()
+
+        events = selector.select(timeout=0.1)
+
+        if not events:
+            continue
+
+        data = os.read(process.stdout.fileno(), 4096)
+
+        if not data:
+            break
+
+        buffer += data
+        process_buffer()
+
+    erase_progress()
+
+    if buffer:
+        write(buffer.decode("utf-8", errors="replace"))
+
+    if progress:
+        show_progress()
+        write("\n")
+
+finally:
+    selector.close()
+    process.stdout.close()
+
+returncode = process.wait()
+
+if returncode < 0:
+    returncode = 128 + abs(returncode)
+
+sys.exit(returncode)
+PYTHON
+}
+
 _main(){
   if [ "$DEBUG" = true ]; then
     set -x
@@ -857,9 +1154,15 @@ _main(){
 
   if ! _check_target_accessible "$ACCESS_T" "$BASE_URL"; then
     echo "[!] Aucune réponse TCP immédiate depuis $ACCESS_T."
-    echo "[!] L'IP de $ACCESS_T est peut être incorrecte (reset HTB ?)."
+    echo "[!] Plusieurs causes sont possibles :"
+    echo "[!] - Adresse IP incorrecte (reset HTB ?)."
+    echo "[!] - Cible inaccessible ou service web arrêté."
+    echo "[!] - Serveur web utilisant un port non standard."
+    echo
     echo "[!] Vérifie l'IP dans l'interface HTB"
     echo "[!] et /etc/hosts si tu utilises un nom de domaine."
+    echo "[!] Si nécessaire, précise le port HTTP découvert par Nmap."
+    echo "[!] Exemple : mon-recoweb cible.htb:3000"
     echo
     echo "[!] Arrêt du script."
     exit 1
@@ -940,9 +1243,9 @@ _main(){
   fi
 
   if [[ -n "$RATE_EFFECTIVE" ]]; then
-    echo "[*] ffuf   : threads=$THREADS rate=$RATE_EFFECTIVE timeout=${TIMEOUT}s fc=$FFUF_FC"
+    echo "[*] ffuf   : threads=$THREADS rate=$RATE_EFFECTIVE timeout=${TIMEOUT}s mc=$FFUF_MC fc=$FFUF_FC"
   else
-    echo "[*] ffuf   : threads=$THREADS timeout=${TIMEOUT}s fc=$FFUF_FC"
+    echo "[*] ffuf   : threads=$THREADS timeout=${TIMEOUT}s mc=$FFUF_MC fc=$FFUF_FC"
   fi
 
   if [[ -n "${FFUF_EXTRA_OPTS:-}" ]]; then
@@ -959,12 +1262,10 @@ _main(){
   local LOG_DIRB
   local HITS_DIRB
 
-  local LOG_FFUF_DIRS
   local JSON_DIRS
   local TXT_DIRS
   local HITS_DIRS
 
-  local LOG_FFUF_FILES
   local JSON_FILES
   local TXT_FILES
   local HITS_FILES
@@ -972,12 +1273,10 @@ _main(){
   LOG_DIRB="$(mktemp)"
   HITS_DIRB="$(mktemp)"
 
-  LOG_FFUF_DIRS="$(mktemp)"
   JSON_DIRS="$(mktemp)"
   TXT_DIRS="$(mktemp)"
   HITS_DIRS="$(mktemp)"
 
-  LOG_FFUF_FILES="$(mktemp)"
   JSON_FILES="$(mktemp)"
   TXT_FILES="$(mktemp)"
   HITS_FILES="$(mktemp)"
@@ -1022,17 +1321,17 @@ _main(){
     echo
     echo "[+] Phase 2/3: ffuf directories"
 
-    ffuf -u "${BASE_URL%/}/FUZZ" \
+    _ffuf_adaptive -u "${BASE_URL%/}/FUZZ" \
       -w "$RAFT_DIRS" \
       -t "$THREADS" \
       ${RATE_EFFECTIVE:+-rate "$RATE_EFFECTIVE"} \
       -timeout "$TIMEOUT" \
+      -mc "$FFUF_MC" \
       -fc "$FFUF_FC" \
       ${EFFECTIVE_FS:+-fs "$EFFECTIVE_FS"} \
       ${FFUF_EXTRA_OPTS:+$FFUF_EXTRA_OPTS} \
       -of json \
-      -o "$JSON_DIRS" \
-      2>&1 | tee "$LOG_FFUF_DIRS"
+      -o "$JSON_DIRS" 
 
     _ffuf_export_txt_from_json \
       "$JSON_DIRS" \
@@ -1054,18 +1353,18 @@ _main(){
     echo
     echo "[+] Phase 3/3: ffuf files"
 
-    ffuf -u "${BASE_URL%/}/FUZZ" \
+    _ffuf_adaptive -u "${BASE_URL%/}/FUZZ" \
       -w "$RAFT_FILES" \
       -t "$THREADS" \
       ${RATE_EFFECTIVE:+-rate "$RATE_EFFECTIVE"} \
       -timeout "$TIMEOUT" \
+      -mc "$FFUF_MC" \
       -fc "$FFUF_FC" \
       ${EFFECTIVE_FS:+-fs "$EFFECTIVE_FS"} \
       ${FFUF_EXTS:+-e "$FFUF_EXTS"} \
       ${FFUF_EXTRA_OPTS:+$FFUF_EXTRA_OPTS} \
       -of json \
-      -o "$JSON_FILES" \
-      2>&1 | tee "$LOG_FFUF_FILES"
+      -o "$JSON_FILES" 
 
     _ffuf_export_txt_from_json \
       "$JSON_FILES" \
@@ -1155,6 +1454,7 @@ _main(){
       -t "$THREADS" \
       ${RATE_EFFECTIVE:+-rate "$RATE_EFFECTIVE"} \
       -timeout "$TIMEOUT" \
+      -mc "$FFUF_MC" \
       -fc "$FFUF_FC" \
       ${EFFECTIVE_FS:+-fs "$EFFECTIVE_FS"} \
       ${FFUF_EXTRA_OPTS:+$FFUF_EXTRA_OPTS})"
@@ -1174,6 +1474,7 @@ _main(){
       -t "$THREADS" \
       ${RATE_EFFECTIVE:+-rate "$RATE_EFFECTIVE"} \
       -timeout "$TIMEOUT" \
+      -mc "$FFUF_MC" \
       -fc "$FFUF_FC" \
       ${EFFECTIVE_FS:+-fs "$EFFECTIVE_FS"} \
       ${FFUF_EXTS:+-e "$FFUF_EXTS"} \
@@ -1505,11 +1806,9 @@ _main(){
   rm -f -- \
     "$LOG_DIRB" \
     "$HITS_DIRB" \
-    "$LOG_FFUF_DIRS" \
     "$JSON_DIRS" \
     "$TXT_DIRS" \
     "$HITS_DIRS" \
-    "$LOG_FFUF_FILES" \
     "$JSON_FILES" \
     "$TXT_FILES" \
     "$HITS_FILES"
